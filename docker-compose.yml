@@ -2,6 +2,7 @@
 # đường mặc định cho lớp không có Docker sẵn.
 services:
   serving-a:
+    container_name: serving-a
     build: { context: ., dockerfile: serving/Dockerfile }
     environment: [REGION=a, STATE_DIR=/state, WARMUP_SECONDS=6]
     volumes: ["./state/region-a:/state"]
@@ -9,6 +10,7 @@ services:
     cap_add: [NET_ADMIN]   # cần cho chaos --mode netblock (iptables trong container)
 
   serving-b:
+    container_name: serving-b
     build: { context: ., dockerfile: serving/Dockerfile }
     environment: [REGION=b, STATE_DIR=/state, WARMUP_SECONDS=6]
     volumes: ["./state/region-b:/state"]
@@ -16,6 +18,7 @@ services:
     cap_add: [NET_ADMIN]
 
   edge:
+    container_name: edge
     build: { context: ., dockerfile: edge/Dockerfile }
     environment:
       - REGION_A_URL=http://serving-a:8000

@@ -38,19 +38,105 @@ LOG = pathlib.Path("reports/runbook-run.jsonl")
 URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
-def step(n, name, **kw):
-    """TODO: ghi 1 dòng {ts, iso, step, name, ...} vào LOG."""
-    raise NotImplementedError
+from dr.health_checker import probe  # noqa: E402
+
+
+def step(n: int, name: str, **kw) -> dict:
+    """Ghi 1 dòng {ts, iso, step, name, ...} vào LOG."""
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": time.time(),
+        "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+        "step": n,
+        "name": name,
+        **kw,
+    }
+    with LOG.open("a") as f:
+        f.write(json.dumps(rec) + "\n")
+    print("RUNBOOK", json.dumps(rec))
+    return rec
 
 
 def confirm(auto: bool, msg: str) -> bool:
-    """TODO: auto=True -> True; ngược lại hỏi y/N. Đừng bỏ hàm này đi."""
-    raise NotImplementedError
+    """auto=True -> True; ngược lại hỏi y/N. Đừng bỏ hàm này đi."""
+    if auto:
+        return True
+    try:
+        ans = input(f"{msg} [y/N]: ")
+        return ans.strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
 
 
 def run(primary: str, target: str, backend: str, auto: bool) -> dict:
-    """TODO: 7 bước ở trên."""
-    raise NotImplementedError
+    """7 bước runbook theo kịch bản chuẩn."""
+    t_start = time.time()
+
+    # Bước 1: 1 xac_nhan_outage
+    p_ready, p_reason = probe(primary, timeout=1.5)
+    t_ready, t_reason = probe(target, timeout=1.5)
+    step(1, "xac_nhan_outage",
+         primary=primary, primary_ready=p_ready, primary_reason=p_reason,
+         target=target, target_ready=t_ready, target_reason=t_reason)
+
+    # Bước 2: 2 thong_bao_incident
+    confirmed = confirm(auto, f"Xac nhan khoi dong quy trinh failover tu {primary} sang {target}?")
+    if not confirmed:
+        step(2, "thong_bao_incident", confirmed=False, status="aborted_by_operator")
+        return {"ok": False, "error": "aborted_by_operator"}
+    step(2, "thong_bao_incident", confirmed=True, primary=primary, target=target,
+         msg=f"Operator khoi dong failover tu region-{primary} sang region-{target}")
+
+    # Bước 3: 3 scale_gpu_pool (gọi hàm failover đúng 1 lần)
+    fo_res = fo.failover(target=target, backend=backend)
+    step(3, "scale_gpu_pool", target=target, failover_ok=fo_res.get("ok"), detail=fo_res)
+    if not fo_res.get("ok"):
+        return {"ok": False, "error": "failover_failed", "detail": fo_res}
+
+    # Bước 4: 4 verify_state_replica
+    step(4, "verify_state_replica",
+         target=target,
+         rpo_seconds=fo_res.get("rpo_seconds"),
+         docs_lost=fo_res.get("docs_lost"),
+         embed_model_version=fo_res.get("embed_model_version"))
+
+    # Bước 5: 5 dns_cutover
+    step(5, "dns_cutover", active_region=target, ok=fo_res.get("ok"))
+
+    # Bước 6: 6 verify_golden_signals (gửi 10 request đo p95 & error rate)
+    latencies = []
+    errors = 0
+    with httpx.Client(timeout=3.0) as c:
+        for i in range(10):
+            t0 = time.time()
+            try:
+                r = c.get("http://127.0.0.1:8080/v1/infer", params={"q": f"golden-check-{i}"})
+                if r.status_code == 200:
+                    latencies.append((time.time() - t0) * 1000)
+                else:
+                    errors += 1
+            except Exception:
+                errors += 1
+
+    p95 = round(sorted(latencies)[int(len(latencies) * 0.95)], 1) if latencies else None
+    err_rate = round(errors / 10.0, 2)
+    step(6, "verify_golden_signals", req_count=10, error_rate=err_rate, p95_latency_ms=p95)
+
+    # Bước 7: 7 post_incident
+    elapsed = round(time.time() - t_start, 2)
+    step(7, "post_incident", elapsed_s=elapsed,
+         measure_cmd="python tools/measure_rto.py --loadgen reports/drill-2-withdr.jsonl")
+
+    return {
+        "ok": True,
+        "primary": primary,
+        "target": target,
+        "elapsed_s": elapsed,
+        "rpo_seconds": fo_res.get("rpo_seconds"),
+        "docs_lost": fo_res.get("docs_lost"),
+        "p95_latency_ms": p95,
+        "error_rate": err_rate,
+    }
 
 
 if __name__ == "__main__":
